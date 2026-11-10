@@ -1,6 +1,1 @@
-{
-  "name": "Simulazione Onda Meccanica 1D - Ritardo Temporale",
-  "description": "Simulatore didattico interattivo per visualizzare la propagazione delle onde meccaniche e la legge fondamentale y(x,t) = y(0, t - x/v) con corda a particelle e grafici temporali sincronizzati.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
+{"name":"Simulazione Onda Meccanica 1D - Ritardo Temporale","description":"Simulatore didattico interattivo per visualizzare la propagazione delle onde meccaniche e la legge fondamentale y(x,t) \u003d y(0, t - x/v) con corda a particelle e grafici temporali sincronizzati.","requestFramePermissions":[],"majorCapabilities":["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]}

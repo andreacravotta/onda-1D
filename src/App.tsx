@@ -24,9 +24,6 @@ import {
 const STRING_LENGTH = 10.0; // Lunghezza corda in metri
 const PARTICLE_COUNT = 81; // Numero di particelle discrete sulla corda
 const TIME_WINDOW = 8.0; // Finestra temporale visualizzata negli oscilloscopi (secondi)
-const SAMPLE_RATE = 200; // Campioni al secondo nel buffer temporale (200 Hz = dt = 0.005 s)
-const BUFFER_DURATION = 60.0; // Durata massima storica memorizzata nel buffer (secondi)
-const BUFFER_SIZE = Math.floor(BUFFER_DURATION * SAMPLE_RATE);
 const AMPLITUDE_MAX = 1.0; // Ampiezza adimensionale normalizzata (-1 a +1)
 const PULSE_DURATION = 1.6; // Durata totale dell'impulso asimmetrico (secondi)
 const PULSE_RISE_RATIO = 0.75; // 75% salita dolce (1.2s), 25% discesa rapida (0.4s)
@@ -57,25 +54,16 @@ export default function App() {
   const simState = useRef({
     hasStarted: false,
     time: 0.0,
-    maxTime: 0.0,
     lastRafTime: 0,
     lastUiUpdateTime: 0,
     playMode: 'pause' as 'play' | 'pause' | 'rewind',
     velocity: 2.0,
     targetX: 4.0,
     isSineActive: false,
-    sineStartTime: 0.0,
     showOtherParticlesAndWave: false,
-    // Buffer circolare storico di y(0, t): [indice] -> { t: number, y: number }
-    buffer: new Float32Array(BUFFER_SIZE),
-    bufferTime: new Float64Array(BUFFER_SIZE),
-    bufferHead: 0,
-    bufferCount: 0,
-    // Impulsi asimmetrici attivi
+    // Tracciamento esatto e continuo delle sorgenti attive
     activePulses: [] as { startTime: number }[],
-    // Telemetria istantanea per la UI
-    instantY0: 0,
-    instantYX: 0,
+    sineSegments: [] as { startTime: number; endTime: number }[],
   });
 
   // Sincronizza lo stato React nei ref del motore fisico
@@ -101,20 +89,17 @@ export default function App() {
 
   useEffect(() => {
     simState.current.isSineActive = isSineActive;
-    if (isSineActive && simState.current.hasStarted) {
-      simState.current.sineStartTime = simState.current.time;
-    }
   }, [isSineActive]);
 
-  // Funzione che calcola lo spostamento della sorgente y(0, t) ad un dato istante t
-  const evaluateSourceAtTime = useCallback((t: number) => {
+  // Calcolo esatto, continuo e deterministico dello spostamento della sorgente y(0, t)
+  const getSourceDisplacement = useCallback((t: number): number => {
     if (t < 0) return 0;
     let y = 0;
 
-    // 1. Contributo oscillazione sinusoidale
-    if (simState.current.isSineActive) {
-      const tSine = t - simState.current.sineStartTime;
-      if (tSine >= 0) {
+    // 1. Contributo oscillazione sinusoidale per tutti i segmenti attivi
+    for (const seg of simState.current.sineSegments) {
+      if (t >= seg.startTime && t <= seg.endTime) {
+        const tSine = t - seg.startTime;
         y += AMPLITUDE_MAX * Math.sin(2 * Math.PI * SINE_FREQUENCY * tSine);
       }
     }
@@ -139,98 +124,31 @@ export default function App() {
     return Math.max(-1.2, Math.min(1.2, y));
   }, []);
 
-  // Registra un campione nel buffer storico
-  const recordSourceSample = useCallback((t: number, y: number) => {
-    const state = simState.current;
-    const idx = state.bufferHead % BUFFER_SIZE;
-    state.buffer[idx] = y;
-    state.bufferTime[idx] = t;
-    state.bufferHead++;
-    if (state.bufferCount < BUFFER_SIZE) {
-      state.bufferCount++;
-    }
-  }, []);
-
-  // Campiona il valore storico di y(0, t_query) tramite ricerca e interpolazione lineare
-  const sampleHistory = useCallback((tQuery: number): number => {
-    if (tQuery < 0) return 0;
-
-    const state = simState.current;
-    if (state.bufferCount === 0) return 0;
-
-    const newestIdx = (state.bufferHead - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-    const newestTime = state.bufferTime[newestIdx];
-
-    if (tQuery >= newestTime) {
-      return state.buffer[newestIdx];
-    }
-
-    const oldestIdx = (state.bufferHead - state.bufferCount + BUFFER_SIZE) % BUFFER_SIZE;
-    const oldestTime = state.bufferTime[oldestIdx];
-
-    if (tQuery <= oldestTime) {
-      return 0;
-    }
-
-    const approxOffset = Math.floor((newestTime - tQuery) * SAMPLE_RATE);
-    let targetIdx = (state.bufferHead - 1 - approxOffset + BUFFER_SIZE * 4) % BUFFER_SIZE;
-
-    let searchSteps = 0;
-    while (state.bufferTime[targetIdx] > tQuery && searchSteps < 25) {
-      targetIdx = (targetIdx - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-      searchSteps++;
-    }
-    searchSteps = 0;
-    while (
-      targetIdx !== newestIdx &&
-      state.bufferTime[(targetIdx + 1) % BUFFER_SIZE] <= tQuery &&
-      searchSteps < 25
-    ) {
-      targetIdx = (targetIdx + 1) % BUFFER_SIZE;
-      searchSteps++;
-    }
-
-    const nextIdx = (targetIdx + 1) % BUFFER_SIZE;
-    const t0 = state.bufferTime[targetIdx];
-    const t1 = state.bufferTime[nextIdx];
-    const y0 = state.buffer[targetIdx];
-    const y1 = state.buffer[nextIdx];
-
-    if (t1 === t0) return y0;
-
-    const alpha = Math.max(0, Math.min(1, (tQuery - t0) / (t1 - t0)));
-    return y0 + alpha * (y1 - y0);
-  }, []);
-
-  // Calcola lo spostamento di una particella a posizione x e tempo t: y(x, t) = y(0, t - x/v)
+  // Legge d'onda fondamentale: y(x, t) = y(0, t - x/v)
   const getDisplacementAt = useCallback(
     (x: number, t: number, v: number): number => {
       const delay = x / v;
       const tDelayed = t - delay;
-      return sampleHistory(tDelayed);
+      if (tDelayed < 0) return 0;
+      return getSourceDisplacement(tDelayed);
     },
-    [sampleHistory]
+    [getSourceDisplacement]
   );
 
-  // Azione: invio impulso asimmetrico (avvia la simulazione al primo click)
+  // Azione: invio impulso asimmetrico (azzera il tempo a t = 0.00s per chiarezza didattica immediata)
   const triggerAsymmetricPulse = useCallback(() => {
     const state = simState.current;
-    if (!state.hasStarted) {
-      state.hasStarted = true;
-      setHasStarted(true);
-      state.time = 0.0;
-      state.maxTime = 0.0;
-      state.activePulses = [{ startTime: 0.0 }];
-      state.playMode = 'play';
-      setPlayMode('play');
-    } else {
-      const now = state.time;
-      state.activePulses.push({ startTime: now });
-      if (state.playMode !== 'play') {
-        state.playMode = 'play';
-        setPlayMode('play');
-      }
-    }
+    state.hasStarted = true;
+    setHasStarted(true);
+    state.time = 0.0;
+    state.lastRafTime = 0;
+    state.activePulses = [{ startTime: 0.0 }];
+    state.isSineActive = false;
+    state.sineSegments = [];
+    setIsSineActive(false);
+    state.playMode = 'play';
+    setPlayMode('play');
+    setCurrentTimeDisplay(0.0);
   }, []);
 
   // Azione: commutazione onda sinusoidale (avvia la simulazione al primo click)
@@ -240,9 +158,8 @@ export default function App() {
       state.hasStarted = true;
       setHasStarted(true);
       state.time = 0.0;
-      state.maxTime = 0.0;
       state.isSineActive = true;
-      state.sineStartTime = 0.0;
+      state.sineSegments = [{ startTime: 0.0, endTime: Infinity }];
       setIsSineActive(true);
       state.playMode = 'play';
       setPlayMode('play');
@@ -251,7 +168,11 @@ export default function App() {
         const next = !prev;
         state.isSineActive = next;
         if (next) {
-          state.sineStartTime = state.time;
+          state.sineSegments.push({ startTime: state.time, endTime: Infinity });
+        } else {
+          if (state.sineSegments.length > 0) {
+            state.sineSegments[state.sineSegments.length - 1].endTime = state.time;
+          }
         }
         return next;
       });
@@ -267,15 +188,10 @@ export default function App() {
     const state = simState.current;
     state.hasStarted = false;
     state.time = 0.0;
-    state.maxTime = 0.0;
     state.lastRafTime = 0;
-    state.buffer.fill(0);
-    state.bufferTime.fill(0);
-    state.bufferHead = 0;
-    state.bufferCount = 0;
     state.activePulses = [];
-    state.instantY0 = 0;
-    state.instantYX = 0;
+    state.sineSegments = [];
+    state.isSineActive = false;
     setIsSineActive(false);
     setHasStarted(false);
     setPlayMode('pause');
@@ -318,19 +234,8 @@ export default function App() {
 
       if (!state.hasStarted) {
         state.time = 0.0;
-        state.maxTime = 0.0;
       } else if (state.playMode === 'play') {
         state.time += dt;
-
-        if (state.time >= state.maxTime) {
-          state.maxTime = state.time;
-          const currentY0 = evaluateSourceAtTime(state.time);
-          recordSourceSample(state.time, currentY0);
-
-          state.activePulses = state.activePulses.filter(
-            (p) => state.time - p.startTime < BUFFER_DURATION
-          );
-        }
       } else if (state.playMode === 'rewind') {
         state.time = Math.max(0, state.time - dt * 0.5);
         if (state.time <= 0) {
@@ -339,9 +244,6 @@ export default function App() {
           setPlayMode('pause');
         }
       }
-
-      state.instantY0 = sampleHistory(state.time);
-      state.instantYX = getDisplacementAt(state.targetX, state.time, state.velocity);
 
       if (currentTime - state.lastUiUpdateTime > 60) {
         state.lastUiUpdateTime = currentTime;
@@ -397,7 +299,7 @@ export default function App() {
           ctx.setLineDash([]);
 
           // Posizione orizzontale e verticale della sorgente (x = 0)
-          const sourceYDisp = sampleHistory(tNow);
+          const sourceYDisp = getDisplacementAt(0, tNow, v);
           const sourceYPix = midY - sourceYDisp * yAmplitudeScale;
           const sourceXPix = padL;
 
@@ -433,14 +335,14 @@ export default function App() {
           ctx.strokeRect(probeXPix - windowW / 2, padTop, windowW, simH);
           ctx.setLineDash([]);
 
-          ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
+          ctx.font = '600 11px system-ui, sans-serif';
           ctx.fillStyle = '#1D4ED8';
           ctx.textAlign = 'center';
           ctx.fillText(`x = ${selX.toFixed(1)} m`, probeXPix, padTop - 12);
 
           // SE L'UTENTE HA ATTIVATO "MOSTRA ALTRE PARTICELLE":
           if (showAll) {
-            // Curva continua della perturbazione y(x)
+            // Curva continua della perturbazione y(x) nello spazio
             ctx.beginPath();
             ctx.strokeStyle = '#3B82F6';
             ctx.lineWidth = 2.5;
@@ -493,7 +395,7 @@ export default function App() {
           ctx.lineWidth = 1.5;
           ctx.stroke();
 
-          ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
+          ctx.font = '600 11px system-ui, sans-serif';
           ctx.fillStyle = '#DC2626';
           ctx.textAlign = 'center';
           ctx.fillText('Sorgente (x = 0)', padL, padTop - 12);
@@ -521,7 +423,7 @@ export default function App() {
           ctx.lineTo(padL + simW, padTop + simH);
           ctx.stroke();
 
-          ctx.font = '500 11px "JetBrains Mono", monospace';
+          ctx.font = '500 11px monospace';
           ctx.fillStyle = '#475569';
           ctx.textAlign = 'center';
 
@@ -542,14 +444,14 @@ export default function App() {
             ctx.stroke();
           }
 
-          ctx.font = '600 12px "Plus Jakarta Sans", sans-serif';
+          ctx.font = '600 12px system-ui, sans-serif';
           ctx.fillStyle = '#334155';
           ctx.textAlign = 'right';
           ctx.fillText('Posizione x (m) ➔', padL + simW, padTop + simH + 34);
 
           // Indicatore della modalità attiva in basso a sinistra
           ctx.textAlign = 'left';
-          ctx.font = '600 11px "JetBrains Mono", monospace';
+          ctx.font = '600 11px monospace';
           ctx.fillStyle = showAll ? '#2563EB' : '#DC2626';
           ctx.fillText(
             showAll
@@ -561,7 +463,7 @@ export default function App() {
 
           // Scala asse Y a sinistra
           ctx.textAlign = 'right';
-          ctx.font = '500 11px "JetBrains Mono", monospace';
+          ctx.font = '500 11px monospace';
           ctx.fillStyle = '#64748B';
           ctx.fillText('+A', padL - 8, midY - yAmplitudeScale + 4);
           ctx.fillText('0', padL - 8, midY + 4);
@@ -688,7 +590,7 @@ export default function App() {
         ctx.strokeStyle = '#FFFFFF';
         ctx.stroke();
 
-        ctx.font = '600 11px "JetBrains Mono", monospace';
+        ctx.font = '600 11px monospace';
         ctx.fillStyle = '#0F172A';
         ctx.textAlign = 'right';
         ctx.fillText(`t = ${tNow.toFixed(2)}s`, padL + plotW, padTop + plotH + 18);
@@ -698,7 +600,7 @@ export default function App() {
         ctx.fillText(`t - ${TIME_WINDOW.toFixed(0)}s`, padL, padTop + plotH + 18);
 
         ctx.textAlign = 'center';
-        ctx.font = '500 10px "JetBrains Mono", monospace';
+        ctx.font = '500 10px monospace';
         for (let tGrid = firstMajorSecond; tGrid <= tEnd - 0.4; tGrid += 1.0) {
           const frac = (tGrid - tStart) / TIME_WINDOW;
           if (frac > 0.08 && frac < 0.92) {
@@ -708,19 +610,19 @@ export default function App() {
         }
 
         ctx.textAlign = 'right';
-        ctx.font = '500 11px "JetBrains Mono", monospace';
+        ctx.font = '500 11px monospace';
         ctx.fillStyle = '#64748B';
         ctx.fillText('+A', padL - 8, midY - yAmp + 4);
         ctx.fillText('0', padL - 8, midY + 4);
         ctx.fillText('-A', padL - 8, midY + yAmp + 4);
 
         ctx.textAlign = 'left';
-        ctx.font = '600 12px "Plus Jakarta Sans", sans-serif';
+        ctx.font = '600 12px system-ui, sans-serif';
         ctx.fillStyle = '#1E293B';
         ctx.fillText(title, padL + 10, padTop + 16);
 
         ctx.textAlign = 'right';
-        ctx.font = '600 11px "JetBrains Mono", monospace';
+        ctx.font = '600 11px monospace';
         ctx.fillStyle = lineColor;
         ctx.fillText(`y = ${currentY >= 0 ? '+' : ''}${currentY.toFixed(2)}`, padL + plotW - 10, padTop + 16);
 
@@ -756,7 +658,7 @@ export default function App() {
               ctx.lineTo(markerX + 5, arrowY + 3);
               ctx.stroke();
 
-              ctx.font = '600 10px "JetBrains Mono", monospace';
+              ctx.font = '600 10px monospace';
               ctx.textAlign = 'center';
               ctx.fillText(`Δt = ${delaySec.toFixed(2)}s`, markerX + delayPix / 2, arrowY - 4);
               ctx.restore();
@@ -773,7 +675,7 @@ export default function App() {
         'Grafico 1: Oscilloscopio Sorgente — y(0, t)',
         '#DC2626',
         '#DC2626',
-        (tSample) => sampleHistory(tSample)
+        (tSample) => getDisplacementAt(0, tSample, v)
       );
 
       // Grafico 2: Particella a coordinata X
@@ -791,7 +693,7 @@ export default function App() {
 
     animationFrameId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animationFrameId);
-  }, [evaluateSourceAtTime, recordSourceSample, sampleHistory, getDisplacementAt]);
+  }, [getDisplacementAt]);
 
   const delaySeconds = parseFloat((targetX / velocity).toFixed(2));
 
@@ -943,7 +845,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* SEZIONE 2: CONTROLLI SPERIMENTALI (Timeline rimossa, tasto riavvolgi mantenuto) */}
+        {/* SEZIONE 2: CONTROLLI SPERIMENTALI */}
         <section className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 shadow-xs space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
@@ -1014,7 +916,7 @@ export default function App() {
               <span>{isSineActive ? 'Arresta Sinusoide' : 'Onda Sinusoidale'}</span>
             </button>
 
-            {/* Pulsante Riavvolgi a velocità 0.5x (MANTENUTO) */}
+            {/* Pulsante Riavvolgi a velocità 0.5x */}
             <button
               onClick={() => {
                 if (!hasStarted) return;
@@ -1067,6 +969,46 @@ export default function App() {
               <RotateCcw className="w-4 h-4 text-slate-500" />
               <span>Azzera</span>
             </button>
+          </div>
+
+          {/* Box Didattico Verifica Ritardo Temporale */}
+          <div className="bg-blue-50/70 border border-blue-200 text-blue-900 px-3.5 py-2.5 rounded-lg text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Clock className="w-4 h-4 text-blue-600 shrink-0" />
+              <div>
+                <span className="font-bold">Verifica Ritardo Temporale:</span>{' '}
+                <span className="text-slate-700">
+                  {!hasStarted
+                    ? `Premendo "Invia Impulso", il cronometro riparte da t = 0.00s e la pallina blu si muove a t = Δt = ${delaySeconds.toFixed(2)}s.`
+                    : isSineActive
+                    ? `Onda continua: sfasamento alla posizione X pari a Δt = ${delaySeconds.toFixed(2)}s.`
+                    : currentTimeDisplay < delaySeconds
+                    ? `⚡ Impulso in propagazione: mancano ${(delaySeconds - currentTimeDisplay).toFixed(2)}s all'arrivo sulla particella blu...`
+                    : currentTimeDisplay <= delaySeconds + PULSE_DURATION
+                    ? `🔵 LA PARTICELLA BLU SI STA MUOVENDO ORA! (picco a ${(delaySeconds + PULSE_DURATION * PULSE_RISE_RATIO).toFixed(2)}s). Ritardo verificato!`
+                    : `✅ Impulso transitato oltre X. Ritardo Δt = ${delaySeconds.toFixed(2)}s verificato con successo!`}
+                </span>
+              </div>
+            </div>
+            <span
+              className={`font-mono text-xs font-bold px-2 py-0.5 rounded border shrink-0 self-start sm:self-auto ${
+                !hasStarted
+                  ? 'bg-white border-blue-200 text-blue-700'
+                  : currentTimeDisplay < delaySeconds
+                  ? 'bg-amber-50 border-amber-300 text-amber-800 animate-pulse'
+                  : currentTimeDisplay <= delaySeconds + PULSE_DURATION
+                  ? 'bg-blue-600 border-blue-700 text-white'
+                  : 'bg-emerald-50 border-emerald-300 text-emerald-800'
+              }`}
+            >
+              {!hasStarted
+                ? `Δt = ${delaySeconds.toFixed(2)}s`
+                : currentTimeDisplay < delaySeconds
+                ? `Arrivo tra ${(delaySeconds - currentTimeDisplay).toFixed(2)}s`
+                : currentTimeDisplay <= delaySeconds + PULSE_DURATION
+                ? `🔵 In movimento!`
+                : `✅ Δt = ${delaySeconds.toFixed(2)}s OK`}
+            </span>
           </div>
 
           {/* Slider Parametro Fisico: Velocità di propagazione (v) */}
@@ -1141,7 +1083,7 @@ export default function App() {
           </div>
         </section>
 
-        {/* Guida Didattica & Note sull'Asimmetria dell'Impulso */}
+        {/* Guida Didattica */}
         <section className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 shadow-xs text-xs sm:text-sm text-slate-600 space-y-3">
           <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
             <Info className="w-4 h-4 text-blue-600" />
