@@ -1,0 +1,6 @@
+{
+  "summary":  "Piano di implementazione per la simulazione interattiva della propagazione di un'onda meccanica 1D e del principio di ritardo temporale y(x,t) = y(0, t - x/v). Definisce la struttura dell'interfaccia a 3 viste coordinate (corda spaziale + 2 oscilloscopi temporali allineati), il buffer circolare della sorgente, i controlli reattivi e il design tecnico minimale.",
+  "updatedAt":  "2026-11-10T10:42:14.124926215Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
